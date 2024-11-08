@@ -9,7 +9,7 @@ This repository contains scripts and configurations to interact with Jira and ma
 3. [Setup](#setup)
 4. [Usage](#usage)
     - [Create Jira API Token](#create-jira-api-token)
-    - [Find Jira Project IDs](#find-jira-project-ids)
+    - [Find Jira Project ID](#find-jira-project-id)
     - [Create Tickets from SARIF](#create-tickets-from-sarif)
 5. [License](#license)
 
@@ -42,7 +42,7 @@ This repository automates the process of creating Jira tickets based on vulnerab
    export JIRA_USER_EMAIL='your_jira_user_email@example.com'
    export JIRA_API_TOKEN='your_jira_api_token'   # see Create Jira API Token below
 
-   export JIRA_PROJECT_ID='your_jira_project_id' # see Find Jira Project IDs below
+   export JIRA_PROJECT_ID='your_jira_project_id' # see Find Jira Project ID below
    export JIRA_ISSUE_TYPE='your_jira_issue_type' # optional, defaults to 'Task'
    export JIRA_COMPONENT='your_jira_component'   # optional
    ```
