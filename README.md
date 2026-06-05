@@ -33,8 +33,9 @@ This repository automates the process of creating Jira tickets based on vulnerab
 
 2. **Install required packages:**
    ```sh
-   pip install argparse jira
+   pip install jira
    ```
+   (`argparse` is part of the Python standard library and does not need to be installed.)
 
 3. **Set environment variables:**
    ```sh
@@ -113,8 +114,9 @@ Example output:
    Usage:
    ```
    usage: python sarif-to-jira.py [-h] --url URL --email EMAIL --token TOKEN -p PROJECT-ID -i TYPE -c COMPONENT
+                                  [--sarif-file SARIF_FILE] [--dry-run] [--max-issues N]
 
-   Create Jira tickets from SARIF report.
+   Create Jira tickets from a NightVision SARIF report (deduped, severity-mapped).
 
    optional arguments:
    -h, --help            show this help message and exit
@@ -131,4 +133,45 @@ Example output:
                            Issue type - defaults to 'Task' (JIRA_ISSUE_TYPE environment variable)
    -c COMPONENT, --component COMPONENT
                            Issue component (JIRA_COMPONENT environment variable)
+
+   Run options:
+   --sarif-file SARIF_FILE
+                           Path to the SARIF report - defaults to 'results.sarif'
+   --dry-run               Report what would be created without creating any Jira issues
+                           (still connects to Jira to classify create vs skip)
+   --max-issues N          Stop after N issues are created (in dry-run, after N would be created)
    ```
+
+### De-duplication and severity
+
+Each ticket this script creates is tagged with two Jira labels: a constant
+`nightvision` label and a per-finding `nv-fingerprint:<key>` label. Before creating a
+ticket the script searches the project for that `nv-fingerprint:<key>` label and skips the
+finding if a ticket already exists. As a result:
+
+- Running the script repeatedly against the same scan creates each ticket **once**;
+  re-runs only fill gaps. (Previously every run created a fresh duplicate of every
+  finding.) Tickets are never updated or closed by this script.
+- The correlation key is the durable `nightvision-fingerprint` emitted in the SARIF
+  when present, and a best-effort hash of the finding's class, source location, and
+  endpoint otherwise. Note: SARIF produced by different NightVision producers
+  (CLI vs platform download/email) may not yet share the same key, so a duplicate
+  can appear once across producers until fingerprint parity lands.
+- Finding severity (`nightvision-risk`) is mapped to a Jira priority
+  (CRITICAL -> Highest, HIGH -> High, MEDIUM -> Medium, LOW -> Low, INFO -> Lowest).
+  The priority is applied only if your Jira priority scheme defines that name;
+  otherwise it is omitted rather than failing the create.
+
+**Upgrading from a version without `nv-fingerprint:` labels.** De-duplication
+matches on the `nv-fingerprint:<key>` label, which earlier versions of this script
+did not attach. The first run after upgrading will not recognize tickets created by
+an older version, so it will create one new (deduped) ticket per overlapping
+finding. If you have run an older version against a Jira project you want to keep
+clean, relabel or close those tickets first, or expect a one-time duplicate set on
+that first run.
+
+Use `--dry-run` to preview what would be created, and `--max-issues N` as a safety
+cap on large reports. Note that `--dry-run` still connects to Jira and runs the
+per-finding dedup search so it can report would-create vs would-skip; it only
+suppresses ticket creation, so it requires valid credentials and a reachable
+project.
