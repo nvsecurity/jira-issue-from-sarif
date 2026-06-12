@@ -8,6 +8,7 @@ A FakeJira stands in for the real client so dedup, severity mapping, dry-run,
 and 429 backoff are exercised without a live Jira.
 """
 
+import argparse
 import importlib.util
 import os
 import re
@@ -87,6 +88,45 @@ class FlakyJira(FakeJira):
         if self.remaining_failures > 0:
             self.remaining_failures -= 1
             raise s2j.JIRAError(text="rate limited", status_code=429)
+        return super().create_issue(fields)
+
+
+class FlakySearchJira(FakeJira):
+    """Raises 429 a fixed number of times on search before succeeding."""
+
+    def __init__(self, fail_times):
+        super().__init__()
+        self.remaining_failures = fail_times
+
+    def search_issues(self, jql, maxResults=1):
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise s2j.JIRAError(text="rate limited", status_code=429)
+        return super().search_issues(jql, maxResults=maxResults)
+
+
+class JQLRecordingJira(FakeJira):
+    """Records every JQL string passed to search, for injection-safety assertions."""
+
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+
+    def search_issues(self, jql, maxResults=1):
+        self.queries.append(jql)
+        return super().search_issues(jql, maxResults=maxResults)
+
+
+class OneCreateFailsJira(FakeJira):
+    """Raises a non-429 error on the one create whose summary matches a marker."""
+
+    def __init__(self, fail_summary_substr):
+        super().__init__()
+        self.fail_summary_substr = fail_summary_substr
+
+    def create_issue(self, fields):
+        if self.fail_summary_substr in fields["summary"]:
+            raise s2j.JIRAError(text="bad request", status_code=400)
         return super().create_issue(fields)
 
 
@@ -233,6 +273,134 @@ class ImportLoopTests(unittest.TestCase):
             valid_priorities=self.priorities, sleep_fn=slept.append, log=silent)
         self.assertEqual(counts["created"], 1)
         self.assertEqual(len(slept), 2)  # two backoffs before success
+
+    def test_429_on_search_is_retried(self):
+        # _retry_on_429 wraps the find_existing search too, not just create.
+        sarif = make_sarif([make_result("SQLi", endpoint="/a", risk="HIGH", fingerprint="fp1")])
+        jira = FlakySearchJira(fail_times=2)
+        slept = []
+        counts = s2j.import_findings(
+            jira, sarif, project_id="1", issue_type="Task", component_id=None,
+            valid_priorities=self.priorities, sleep_fn=slept.append, log=silent)
+        self.assertEqual(counts["created"], 1)
+        self.assertEqual(len(slept), 2)  # two search backoffs before the search succeeds
+
+
+class MaxIssuesValidationTests(unittest.TestCase):
+    def test_positive_int_accepts_one_or_greater(self):
+        self.assertEqual(s2j.positive_int("1"), 1)
+        self.assertEqual(s2j.positive_int("3"), 3)
+
+    def test_positive_int_rejects_zero_and_negative(self):
+        # A non-positive cap would make --max-issues a silent no-op (exit 0); it
+        # must fail fast at parse time.
+        for bad in ("0", "-1"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                s2j.positive_int(bad)
+
+
+class SarifShapeValidationTests(unittest.TestCase):
+    def test_accepts_documents_with_a_runs_list(self):
+        s2j.require_runs({"runs": []})  # empty but structurally valid SARIF
+        s2j.require_runs(make_sarif([]))
+        s2j.require_runs(make_sarif([make_result("SQLi", endpoint="/a")]))
+
+    def test_rejects_valid_json_that_is_not_sarif(self):
+        # The fail-open J guards against: valid JSON lacking a top-level runs array
+        # must raise (-> non-zero exit) instead of silently importing nothing.
+        for bad in ({}, None, [], 5, {"runs": "x"}, {"runs": None}):
+            with self.assertRaises(ValueError):
+                s2j.require_runs(bad)
+
+
+class FingerprintContractTests(unittest.TestCase):
+    """Pin the recipe-v1 cross-producer fingerprint contract from the consumer side.
+
+    The CLI (NV-4411, cli/pkg/sarif/fingerprint.go) and the backend (NV-4417,
+    nimbler_django/issue/fingerprint.py) emit these exact lowercase-hex values in
+    properties["nightvision-fingerprint"]. This importer must dedup on that value
+    verbatim, so a finding from either producer maps to the same Jira ticket. These
+    vectors are frozen; changing them is a coordinated breaking recipe bump across
+    all three repos.
+    """
+
+    GOLDEN_FINGERPRINTS = (
+        "41ac5998fac68d373ed7982da071deb62de802038cde6d618d4ad6bb70d72ed6",
+        "097cf680a80a7e772291c4863683053ff15f806fbe12ced91e271bff40c4de6a",
+    )
+
+    def test_durable_fingerprint_used_verbatim(self):
+        for fp in self.GOLDEN_FINGERPRINTS:
+            r = make_result("SQL Injection", endpoint="/api/orders", fingerprint=fp)
+            key, scheme = s2j.correlation_key(r)
+            self.assertEqual(scheme, "fingerprint")
+            # Consumed as-is: a clean recipe-v1 hex is already label/JQL-safe, so it
+            # must NOT be re-hashed - otherwise this importer would dedup on a
+            # different key than the producer emitted, splitting the ticket.
+            self.assertEqual(key, fp)
+            self.assertEqual(s2j.normalize_key(fp), fp)
+            self.assertEqual(s2j.fp_label(key), s2j.FP_LABEL_PREFIX + fp)
+
+
+class JqlSafetyTests(unittest.TestCase):
+    """A producer fingerprint is producer-supplied, so it must not break out of the
+    JQL label literal in the dedup search."""
+
+    def test_hostile_fingerprint_cannot_inject_jql(self):
+        hostile = 'evil" OR project = "ADMIN'
+        sarif = make_sarif([
+            make_result("SQLi", endpoint="/a", risk="HIGH", fingerprint=hostile)])
+        jira = JQLRecordingJira()
+        common = dict(
+            project_id="1", issue_type="Task", component_id=None,
+            valid_priorities={"High"}, sleep_fn=silent, log=silent)
+        s2j.import_findings(jira, sarif, **common)
+        # Second run with the same finding must dedup, proving the label written and
+        # the label searched are the same safe normalized value.
+        counts = s2j.import_findings(jira, sarif, **common)
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(len(jira.created), 1)
+        # Every search embeds only the safe normalized label; no injected operator
+        # survives into the JQL.
+        self.assertTrue(jira.queries)
+        for jql in jira.queries:
+            m = re.search(r'labels = "([^"]+)"', jql)
+            self.assertIsNotNone(m)
+            self.assertRegex(m.group(1), r"^" + re.escape(s2j.FP_LABEL_PREFIX) + r"[a-f0-9]{64}$")
+            self.assertNotIn("OR project", jql)
+
+
+class FailureIsolationTests(unittest.TestCase):
+    def test_one_finding_failure_does_not_abort_the_run(self):
+        sarif = make_sarif([
+            make_result("SQL Injection", endpoint="/api/orders", risk="CRITICAL", fingerprint="fp-1"),
+            make_result("Verbose Banner", endpoint="/api/info", risk="LOW", fingerprint="fp-2"),
+        ])
+        jira = OneCreateFailsJira("SQL Injection")
+        counts = s2j.import_findings(
+            jira, sarif, project_id="1", issue_type="Task", component_id=None,
+            valid_priorities={"Highest", "Low"}, sleep_fn=silent, log=silent)
+        # The failing create is counted and isolated; the other finding still lands.
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["created"], 1)
+        self.assertEqual(len(jira.created), 1)
+        self.assertEqual(jira.created[0]["summary"], "Verbose Banner at /api/info")
+
+    def test_in_report_duplicate_of_create_failure_is_not_retried(self):
+        # Same correlation key twice with a failing create: the duplicate must be
+        # caught by in-report dedup (one failure, not two), symmetric with the
+        # search-failure path.
+        sarif = make_sarif([
+            make_result("SQL Injection", endpoint="/api/orders", risk="CRITICAL", fingerprint="dup"),
+            make_result("SQL Injection", endpoint="/api/orders", risk="CRITICAL", fingerprint="dup"),
+        ])
+        jira = OneCreateFailsJira("SQL Injection")
+        counts = s2j.import_findings(
+            jira, sarif, project_id="1", issue_type="Task", component_id=None,
+            valid_priorities={"Highest"}, sleep_fn=silent, log=silent)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(counts["created"], 0)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,16 @@ results.sarif
 *.yaml
 *.json
 
+# The blanket *.yml / *.yaml / *.json ignores above target SARIF results and
+# OpenAPI specs; keep CI configuration under .github tracked despite them.
+!.github/**
+
+# Local analysis / work products, kept out of version control by convention.
+analysis/
+
+# Agent sandbox state: local tooling, never part of the repo.
+.agent-sandbox-config/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

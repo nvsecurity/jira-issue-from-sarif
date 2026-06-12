@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # The weekly schedule opens the SHA-pin refresh PRs; the cooldown delays each
+    # one until 7 days after a release is published, so a freshly published
+    # (potentially compromised) version is not pinned immediately.
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
