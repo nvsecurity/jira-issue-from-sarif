@@ -207,12 +207,101 @@ def get_description(result, run):
     return (result.get("message") or {}).get("text") or "No description available."
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Description rendering: Markdown -> ADF (NV-4414)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# NightVision rule descriptions are GitHub-flavored Markdown (bold, inline code,
+# links, bullet lists, emoji). Jira does not render Markdown: sent to the API as a
+# plain string it shows the literal `**`, backticks, and `[text](url)` syntax. We
+# convert it to the Atlassian Document Format (ADF), which Jira Cloud renders
+# natively, so the ticket body is readable instead of raw markup.
+#
+# DEPLOYMENT NOTE (open question on this prospect): ADF is the Jira Cloud rich-text
+# format and is sent over the v3 REST API (selected in main()). Jira Server / Data
+# Center instead use wiki markup over the v2 API; for a Server/DC target a wiki-markup
+# builder is needed in place of to_adf and the client must stay on v2. Validate
+# rendering against the live Jira before relying on it.
+
+# Inline Markdown tokens in match-precedence order: a [text](url) link, then a bare
+# URL, then **bold**, then `code`. They do not overlap in NightVision descriptions,
+# so a single left-to-right scan suffices (no nested-mark handling).
+_ADF_INLINE_RE = re.compile(
+    r"\[(?P<ltext>[^\]]+)\]\((?P<lurl>https?://[^)\s]+)\)"
+    r"|(?P<url>https?://[^\s)]*[^\s).,;:!?])"
+    r"|\*\*(?P<bold>.+?)\*\*"
+    r"|`(?P<code>[^`]+)`"
+)
+
+
+def _adf_text(value, marks=None):
+    node = {"type": "text", "text": value}
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+def _adf_inline_nodes(span):
+    """Parse one line of inline Markdown into a list of ADF inline text nodes."""
+    nodes = []
+    pos = 0
+    for m in _ADF_INLINE_RE.finditer(span):
+        if m.start() > pos and span[pos:m.start()]:
+            nodes.append(_adf_text(span[pos:m.start()]))
+        if m.group("ltext"):
+            nodes.append(_adf_text(m.group("ltext"),
+                                   [{"type": "link", "attrs": {"href": m.group("lurl")}}]))
+        elif m.group("url"):
+            url = m.group("url")
+            nodes.append(_adf_text(url, [{"type": "link", "attrs": {"href": url}}]))
+        elif m.group("bold"):
+            nodes.append(_adf_text(m.group("bold"), [{"type": "strong"}]))
+        elif m.group("code"):
+            nodes.append(_adf_text(m.group("code"), [{"type": "code"}]))
+        pos = m.end()
+    if pos < len(span) and span[pos:]:
+        nodes.append(_adf_text(span[pos:]))
+    return nodes
+
+
+def to_adf(text):
+    """Convert a Markdown description to an ADF document for the Jira v3 API.
+
+    Blocks split on blank lines. A block whose non-empty lines all start with "- "
+    or "* " becomes an ADF bulletList; any other block becomes a paragraph (its
+    lines joined with spaces). Inline **bold**, `code`, [text](url) links, and bare
+    URLs render with the matching ADF marks. Pure and unit tested; emoji and other
+    plain text pass through unchanged.
+    """
+    text = (text or "").strip()
+    content = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        non_empty = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not non_empty:
+            continue
+        if all(ln.startswith("- ") or ln.startswith("* ") for ln in non_empty):
+            items = []
+            for ln in non_empty:
+                item_text = ln[2:].strip()
+                item_nodes = _adf_inline_nodes(item_text) or [_adf_text(item_text or " ")]
+                items.append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": item_nodes}],
+                })
+            content.append({"type": "bulletList", "content": items})
+        else:
+            content.append({"type": "paragraph", "content": _adf_inline_nodes(" ".join(non_empty))})
+    if not content:
+        content.append({"type": "paragraph", "content": []})
+    return {"version": 1, "type": "doc", "content": content}
+
+
 def build_issue_dict(result, run, project_id, issue_type, component_id, valid_priorities, labels):
     """Assemble the Jira create payload for a single finding."""
     fields = {
         "project": {"id": str(project_id)},
         "summary": build_summary(result),
-        "description": get_description(result, run),
+        "description": to_adf(get_description(result, run)),
         "issuetype": {"name": issue_type},
         "labels": labels,
     }
@@ -378,8 +467,13 @@ def main(args):
     # each finding as would-create vs would-skip); it only suppresses ticket creation.
     if args.dry_run:
         print("DRY-RUN: connecting to Jira to classify findings; no issues will be created.")
+    # ADF descriptions (NV-4414) require the v3 REST API; the v2 API expects a plain
+    # string and rejects an ADF document. v3 + ADF is the Jira Cloud path. Jira Server
+    # / Data Center use wiki markup over v2 instead (open question: this prospect's
+    # deployment type), which would need a wiki description builder and v2 here.
     jira = JIRA(
-        basic_auth=(jira_user_email, jira_api_token), options={"server": jira_url}
+        basic_auth=(jira_user_email, jira_api_token),
+        options={"server": jira_url, "rest_api_version": "3"},
     )
 
     # Fail fast on configuration errors, before iterating findings.

@@ -1,11 +1,12 @@
-"""Unit tests for sarif-to-jira.py (NV-4419).
+"""Unit tests for sarif-to-jira.py (NV-4419, NV-4414).
 
 Runs on the standard library only (no jira package, no pytest):
 
     python3 -m unittest test_sarif_to_jira -v
 
 A FakeJira stands in for the real client so dedup, severity mapping, dry-run,
-and 429 backoff are exercised without a live Jira.
+and 429 backoff are exercised without a live Jira. Pure helpers (max-issues
+validation, correlation keys, Markdown-to-ADF rendering) are tested directly.
 """
 
 import argparse
@@ -401,6 +402,73 @@ class FailureIsolationTests(unittest.TestCase):
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(counts["skipped"], 1)
         self.assertEqual(counts["created"], 0)
+
+
+class AdfRenderingTests(unittest.TestCase):
+    """to_adf converts Markdown descriptions to ADF so they render in Jira (NV-4414)."""
+
+    def _para_nodes(self, doc, index=0):
+        self.assertEqual(doc["type"], "doc")
+        self.assertEqual(doc["version"], 1)
+        return doc["content"][index]["content"]
+
+    def test_plain_text_is_one_paragraph(self):
+        doc = s2j.to_adf("just text")
+        self.assertEqual(len(doc["content"]), 1)
+        self.assertEqual(self._para_nodes(doc), [{"type": "text", "text": "just text"}])
+
+    def test_bold_becomes_strong_mark(self):
+        nodes = self._para_nodes(s2j.to_adf("a **bold** word"))
+        strong = [n for n in nodes if n.get("marks") == [{"type": "strong"}]]
+        self.assertEqual(strong, [{"type": "text", "text": "bold", "marks": [{"type": "strong"}]}])
+
+    def test_inline_code_becomes_code_mark(self):
+        nodes = self._para_nodes(s2j.to_adf("set `Cross-Origin-Resource-Policy` header"))
+        code = [n for n in nodes if n.get("marks") == [{"type": "code"}]]
+        self.assertEqual(code[0]["text"], "Cross-Origin-Resource-Policy")
+
+    def test_markdown_link_uses_link_mark_and_text(self):
+        nodes = self._para_nodes(s2j.to_adf("see [the docs](https://example.com/x) now"))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "the docs")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], "https://example.com/x")
+
+    def test_bare_url_becomes_link(self):
+        nodes = self._para_nodes(s2j.to_adf("here: https://test.nightvision.net/scans/1/findings/2"))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "https://test.nightvision.net/scans/1/findings/2")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], link["text"])
+
+    def test_bare_url_strips_trailing_sentence_punctuation(self):
+        nodes = self._para_nodes(s2j.to_adf("see https://test.nightvision.net/findings/2."))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "https://test.nightvision.net/findings/2")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], "https://test.nightvision.net/findings/2")
+        # the trailing period survives as plain text, not part of the URL
+        self.assertTrue(any("." in n.get("text", "") and not n.get("marks") for n in nodes))
+
+    def test_bullet_list_block(self):
+        doc = s2j.to_adf("Refs:\n\n- https://a.example\n- https://b.example")
+        kinds = [b["type"] for b in doc["content"]]
+        self.assertIn("bulletList", kinds)
+        bullet = next(b for b in doc["content"] if b["type"] == "bulletList")
+        self.assertEqual(len(bullet["content"]), 2)
+        self.assertEqual(bullet["content"][0]["type"], "listItem")
+
+    def test_blank_line_splits_paragraphs(self):
+        doc = s2j.to_adf("first para\n\nsecond para")
+        paras = [b for b in doc["content"] if b["type"] == "paragraph"]
+        self.assertEqual(len(paras), 2)
+
+    def test_empty_text_yields_empty_paragraph(self):
+        doc = s2j.to_adf("   ")
+        self.assertEqual(doc["content"], [{"type": "paragraph", "content": []}])
+
+    def test_build_issue_dict_description_is_adf(self):
+        result = make_result("SQLi", endpoint="/x", risk="HIGH")
+        fields = s2j.build_issue_dict(result, {}, "1", "Task", None, {"High"}, ["nightvision"])
+        self.assertIsInstance(fields["description"], dict)
+        self.assertEqual(fields["description"]["type"], "doc")
 
 
 if __name__ == "__main__":
