@@ -1,11 +1,12 @@
-"""Unit tests for sarif-to-jira.py (NV-4419).
+"""Unit tests for sarif-to-jira.py (NV-4419, NV-4414).
 
 Runs on the standard library only (no jira package, no pytest):
 
     python3 -m unittest test_sarif_to_jira -v
 
 A FakeJira stands in for the real client so dedup, severity mapping, dry-run,
-and 429 backoff are exercised without a live Jira.
+and 429 backoff are exercised without a live Jira. Pure helpers (max-issues
+validation, correlation keys, Markdown-to-ADF rendering) are tested directly.
 """
 
 import argparse
@@ -191,12 +192,60 @@ class PriorityAndSummaryTests(unittest.TestCase):
         self.assertIsNone(s2j.map_priority(None))
 
     def test_summary_includes_endpoint(self):
+        # No rule in the run: falls back to message.text for the class name.
         r = make_result("SQL Injection", endpoint="/api/orders")
-        self.assertEqual(s2j.build_summary(r), "SQL Injection at /api/orders")
+        self.assertEqual(s2j.build_summary(r, {}), "SQL Injection at /api/orders")
 
     def test_summary_without_endpoint(self):
         r = make_result("Missing Security Headers")
-        self.assertEqual(s2j.build_summary(r), "Missing Security Headers")
+        self.assertEqual(s2j.build_summary(r, {}), "Missing Security Headers")
+
+    def test_summary_prefers_rule_name_over_message(self):
+        # The summary class name comes from the rule, not message.text.
+        r = make_result("ignored message text", endpoint="/api/orders", rule_id="xss-id")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "name": "Cross Site Scripting (DOM Based)"}]}}}
+        self.assertEqual(
+            s2j.build_summary(r, run),
+            "Cross Site Scripting (DOM Based) at /api/orders")
+
+    def test_summary_falls_back_to_rule_short_description(self):
+        r = make_result("ignored", rule_id="r1")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "r1", "shortDescription": {"text": "SQL Injection"}}]}}}
+        self.assertEqual(s2j.build_summary(r, run), "SQL Injection")
+
+    def test_summary_from_cli_banner_is_single_line_and_bounded(self):
+        # Regression for the CLI producer: message.text is a long multi-line banner,
+        # the short class name is in rule.name. The summary must be single-line,
+        # <= 255 chars, and carry the rule name, not the banner.
+        banner = (
+            "Exploitable Vulnerability Found\n\n"
+            "Cross Site Scripting (DOM Based) on endpoint /search\n\n"
+            "For more information see the issue on NightVision here: "
+            "https://app.nightvision.net/scans/abc/issues/def\n" + ("x" * 3000))
+        r = make_result(banner, endpoint="/search", rule_id="xss-id")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "name": "Cross Site Scripting (DOM Based)"}]}}}
+        summary = s2j.build_summary(r, run)
+        self.assertEqual(summary, "Cross Site Scripting (DOM Based) at /search")
+        self.assertLessEqual(len(summary), s2j.JIRA_SUMMARY_MAX)
+        self.assertNotIn("\n", summary)
+        s2j.validate_summary(summary)  # must not raise
+
+    def test_normalize_summary_truncates_and_strips_newlines(self):
+        long_kind = "A" * 300
+        out = s2j.normalize_summary(long_kind + "\nmore")
+        self.assertEqual(len(out), s2j.JIRA_SUMMARY_MAX)
+        self.assertTrue(out.endswith("..."))
+        self.assertNotIn("\n", out)
+        s2j.validate_summary(out)  # must not raise
+
+    def test_validate_summary_rejects_overlong_and_multiline(self):
+        with self.assertRaises(ValueError):
+            s2j.validate_summary("x" * (s2j.JIRA_SUMMARY_MAX + 1))
+        with self.assertRaises(ValueError):
+            s2j.validate_summary("line one\nline two")
 
 
 class ImportLoopTests(unittest.TestCase):
@@ -401,6 +450,132 @@ class FailureIsolationTests(unittest.TestCase):
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(counts["skipped"], 1)
         self.assertEqual(counts["created"], 0)
+
+
+class AdfRenderingTests(unittest.TestCase):
+    """to_adf converts Markdown descriptions to ADF so they render in Jira (NV-4414)."""
+
+    def _para_nodes(self, doc, index=0):
+        self.assertEqual(doc["type"], "doc")
+        self.assertEqual(doc["version"], 1)
+        return doc["content"][index]["content"]
+
+    def test_plain_text_is_one_paragraph(self):
+        doc = s2j.to_adf("just text")
+        self.assertEqual(len(doc["content"]), 1)
+        self.assertEqual(self._para_nodes(doc), [{"type": "text", "text": "just text"}])
+
+    def test_bold_becomes_strong_mark(self):
+        nodes = self._para_nodes(s2j.to_adf("a **bold** word"))
+        strong = [n for n in nodes if n.get("marks") == [{"type": "strong"}]]
+        self.assertEqual(strong, [{"type": "text", "text": "bold", "marks": [{"type": "strong"}]}])
+
+    def test_inline_code_becomes_code_mark(self):
+        nodes = self._para_nodes(s2j.to_adf("set `Cross-Origin-Resource-Policy` header"))
+        code = [n for n in nodes if n.get("marks") == [{"type": "code"}]]
+        self.assertEqual(code[0]["text"], "Cross-Origin-Resource-Policy")
+
+    def test_markdown_link_uses_link_mark_and_text(self):
+        nodes = self._para_nodes(s2j.to_adf("see [the docs](https://example.com/x) now"))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "the docs")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], "https://example.com/x")
+
+    def test_bare_url_becomes_link(self):
+        nodes = self._para_nodes(s2j.to_adf("here: https://test.nightvision.net/scans/1/findings/2"))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "https://test.nightvision.net/scans/1/findings/2")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], link["text"])
+
+    def test_bare_url_strips_trailing_sentence_punctuation(self):
+        nodes = self._para_nodes(s2j.to_adf("see https://test.nightvision.net/findings/2."))
+        link = [n for n in nodes if any(m.get("type") == "link" for m in n.get("marks", []))][0]
+        self.assertEqual(link["text"], "https://test.nightvision.net/findings/2")
+        self.assertEqual(link["marks"][0]["attrs"]["href"], "https://test.nightvision.net/findings/2")
+        # the trailing period survives as plain text, not part of the URL
+        self.assertTrue(any("." in n.get("text", "") and not n.get("marks") for n in nodes))
+
+    def test_bullet_list_block(self):
+        doc = s2j.to_adf("Refs:\n\n- https://a.example\n- https://b.example")
+        kinds = [b["type"] for b in doc["content"]]
+        self.assertIn("bulletList", kinds)
+        bullet = next(b for b in doc["content"] if b["type"] == "bulletList")
+        self.assertEqual(len(bullet["content"]), 2)
+        self.assertEqual(bullet["content"][0]["type"], "listItem")
+
+    def test_blank_line_splits_paragraphs(self):
+        doc = s2j.to_adf("first para\n\nsecond para")
+        paras = [b for b in doc["content"] if b["type"] == "paragraph"]
+        self.assertEqual(len(paras), 2)
+
+    def test_empty_text_yields_empty_paragraph(self):
+        doc = s2j.to_adf("   ")
+        self.assertEqual(doc["content"], [{"type": "paragraph", "content": []}])
+
+    def test_build_issue_dict_description_is_adf(self):
+        result = make_result("SQLi", endpoint="/x", risk="HIGH")
+        fields = s2j.build_issue_dict(result, {}, "1", "Task", None, {"High"}, ["nightvision"])
+        self.assertIsInstance(fields["description"], dict)
+        self.assertEqual(fields["description"]["type"], "doc")
+
+
+class DescriptionSourceTests(unittest.TestCase):
+    """get_description (Option 1 stopgap): keep fullDescription as the body and
+    always surface the per-finding deep link from message.text."""
+
+    @staticmethod
+    def _hrefs(doc):
+        out = []
+        def walk(n):
+            if isinstance(n, dict):
+                for m in n.get("marks", []) or []:
+                    if m.get("type") == "link":
+                        out.append(m["attrs"]["href"])
+                for c in n.get("content", []) or []:
+                    walk(c)
+        walk(doc)
+        return out
+
+    def test_extract_finding_link(self):
+        link = "https://test.nightvision.net/scans/abc/findings/custom/uuid/?issueId=zzz-111"
+        self.assertEqual(s2j.extract_finding_link("see here: " + link), link)
+        self.assertIsNone(s2j.extract_finding_link("no url here"))
+        # trailing sentence punctuation is not part of the URL
+        self.assertEqual(s2j.extract_finding_link("see " + link + "."), link)
+
+    def test_cli_stub_gets_deep_link_appended(self):
+        link = ("https://test.nightvision.net/scans/abc/findings/31/"
+                "?issueId=39b75813-927c-40de-a326-2dfd023635ef")
+        result = {
+            "ruleId": "xss-id",
+            "message": {"text": "Exploitable Vulnerability Found. For more "
+                                "information see the issue on NightVision here: " + link},
+        }
+        stub = ("Cross Site Scripting (DOM Based). NightVision flags findings of this "
+                "kind; see the individual result for the affected endpoint and "
+                "remediation detail.")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "fullDescription": {"text": stub}}]}}}
+        body = s2j.get_description(result, run)
+        self.assertIn("NightVision flags findings of this kind", body)  # stub kept
+        self.assertIn(link, body)                                       # deep link surfaced
+        self.assertIn(link, self._hrefs(s2j.to_adf(body)))              # renders as a link
+
+    def test_backend_rich_body_not_duplicated(self):
+        # Backend: the deep link already rides inside fullDescription; message.text
+        # is the kind name (no URL). Body stays the rich writeup, link not re-added.
+        link = "https://app.nightvision.net/scans/x/findings/12/?issueId=aaaa-bbbb"
+        rich = "Detailed writeup with remediation. More information: " + link
+        result = {"ruleId": "190", "message": {"text": "Absence of Anti-CSRF Tokens"}}
+        run = {"tool": {"driver": {"rules": [
+            {"id": "190", "fullDescription": {"text": rich}}]}}}
+        body = s2j.get_description(result, run)
+        self.assertEqual(body, rich)
+        self.assertEqual(body.count(link), 1)
+
+    def test_no_url_in_message_means_no_append(self):
+        result = make_result("SQLi", endpoint="/x")  # message.text="SQLi", no rule
+        self.assertEqual(s2j.get_description(result, {}), "SQLi")
 
 
 if __name__ == "__main__":

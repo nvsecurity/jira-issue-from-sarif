@@ -43,7 +43,7 @@ This repository automates the process of creating Jira tickets based on vulnerab
    export JIRA_USER_EMAIL='your_jira_user_email@example.com'
    export JIRA_API_TOKEN='your_jira_api_token'   # see Create Jira API Token below
 
-   export JIRA_PROJECT_ID='your_jira_project_id' # see Find Jira Project ID below
+   export JIRA_PROJECT_ID='your_jira_project_id' # project id or key; see Find Jira Project ID below
    export JIRA_ISSUE_TYPE='your_jira_issue_type' # optional, defaults to 'Task'
    export JIRA_COMPONENT='your_jira_component'   # optional
    ```
@@ -60,6 +60,10 @@ This repository automates the process of creating Jira tickets based on vulnerab
 ## Usage
 
 ### Find Jira Project ID
+
+`--project-id` / `JIRA_PROJECT_ID` accepts either a numeric project id or a
+project key (for example `NV`); a key is resolved to its id automatically. This
+lookup is therefore optional when you already know the project key.
 
 1. Run the following command to list Jira Project IDs:
    ```sh
@@ -128,7 +132,7 @@ Example output:
 
    Issue properties:
    -p PROJECT-ID, --project-id PROJECT-ID
-                           Jira Project ID (JIRA_PROJECT_ID environment variable)
+                           Jira project id or key (JIRA_PROJECT_ID environment variable)
    -i TYPE, --issue-type TYPE
                            Issue type - defaults to 'Task' (JIRA_ISSUE_TYPE environment variable)
    -c COMPONENT, --component COMPONENT
