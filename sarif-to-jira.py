@@ -181,28 +181,83 @@ def positive_int(value):
     return n
 
 
-def build_summary(result):
-    """A distinguishable title: vulnerability class plus endpoint when known.
+# Jira's summary field is single-line and capped at 255 characters; a longer or
+# multi-line value is rejected with HTTP 400 "Summary can't exceed 255 characters".
+JIRA_SUMMARY_MAX = 255
 
-    This stays lightweight; NV-4414 adds the HTTP method and richer
+
+def find_rule(run, rule_id):
+    """Return the SARIF rule object for rule_id from the run's driver rules, or None."""
+    rules = ((run.get("tool") or {}).get("driver") or {}).get("rules") or []
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            return rule
+    return None
+
+
+def summary_kind_name(result, run):
+    """The vulnerability class for the ticket summary, taken from the rule.
+
+    The rule's name (and shortDescription) holds the short class name for both
+    producers, e.g. "Cross Site Scripting (DOM Based)". The finding's message.text
+    is deliberately NOT used here: the CLI emits a long multi-line banner there
+    (the backend emits the short name), so a message.text-derived summary overflows
+    Jira's 255-char limit. Fall back to message.text, then ruleId, only when no rule
+    name is available, so the summary is never empty (and normalize_summary bounds
+    that fallback too).
+    """
+    rule = find_rule(run, result.get("ruleId"))
+    if rule:
+        if rule.get("name"):
+            return rule["name"]
+        short = rule.get("shortDescription") or {}
+        if short.get("text"):
+            return short["text"]
+    return extract_kind_name(result) or "NightVision finding"
+
+
+def normalize_summary(text):
+    """Return a Jira-valid summary: whitespace and newlines collapsed to single
+    spaces, hard-truncated to 255 characters with a trailing ellipsis when cut."""
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= JIRA_SUMMARY_MAX:
+        return collapsed
+    return collapsed[:JIRA_SUMMARY_MAX - 3].rstrip() + "..."
+
+
+def validate_summary(summary):
+    """Tripwire for Jira's summary constraints. normalize_summary already enforces
+    them; validating here (build_issue_dict runs in --dry-run too) makes any future
+    regression of the over-length/multi-line class fail fast, surfacing it in a
+    dry-run instead of as a live create rejection."""
+    if "\n" in summary or "\r" in summary:
+        raise ValueError("Jira summary must be single-line: %r" % (summary,))
+    if len(summary) > JIRA_SUMMARY_MAX:
+        raise ValueError(
+            "Jira summary exceeds %d chars (got %d): %r"
+            % (JIRA_SUMMARY_MAX, len(summary), summary))
+
+
+def build_summary(result, run):
+    """A distinguishable, Jira-valid title: vulnerability class plus endpoint.
+
+    Always single-line and <= 255 chars. The class name comes from the rule
+    (summary_kind_name), not message.text. NV-4414 adds the HTTP method and richer
     formatting once it consumes the durable fingerprint.
     """
-    kind = extract_kind_name(result) or "NightVision finding"
+    kind = summary_kind_name(result, run)
     endpoint = extract_endpoint(result)
-    if endpoint:
-        return "{} at {}".format(kind, endpoint)
-    return kind
+    summary = "{} at {}".format(kind, endpoint) if endpoint else kind
+    return normalize_summary(summary)
 
 
 def get_description(result, run):
     """The rule's full description text, looked up by ruleId (existing behaviour)."""
-    rule_id = result.get("ruleId")
-    rules = ((run.get("tool") or {}).get("driver") or {}).get("rules") or []
-    for rule in rules:
-        if rule.get("id") == rule_id:
-            full = rule.get("fullDescription") or {}
-            if full.get("text"):
-                return full["text"]
+    rule = find_rule(run, result.get("ruleId"))
+    if rule:
+        full = rule.get("fullDescription") or {}
+        if full.get("text"):
+            return full["text"]
     # Fall back to the finding message so the ticket is never bodyless.
     return (result.get("message") or {}).get("text") or "No description available."
 
@@ -300,11 +355,12 @@ def build_issue_dict(result, run, project_id, issue_type, component_id, valid_pr
     """Assemble the Jira create payload for a single finding."""
     fields = {
         "project": {"id": str(project_id)},
-        "summary": build_summary(result),
+        "summary": build_summary(result, run),
         "description": to_adf(get_description(result, run)),
         "issuetype": {"name": issue_type},
         "labels": labels,
     }
+    validate_summary(fields["summary"])
     if component_id:
         fields["components"] = [{"id": component_id}]
 
@@ -398,14 +454,14 @@ def import_findings(jira, sarif_data, project_id, issue_type, component_id,
         # Dedup within this single SARIF file (identical findings emitted twice).
         if key in seen_keys:
             counts["skipped"] += 1
-            log("Skip (duplicate within report) {}: {}".format(scheme, build_summary(result)))
+            log("Skip (duplicate within report) {}: {}".format(scheme, build_summary(result, run)))
             continue
 
         try:
             if find_existing(jira, project_id, label_value, max_retries, sleep_fn):
                 counts["skipped"] += 1
                 seen_keys.add(key)
-                log("Skip (already in Jira) {}: {}".format(label_value, build_summary(result)))
+                log("Skip (already in Jira) {}: {}".format(label_value, build_summary(result, run)))
                 continue
         except JIRAError as e:
             counts["failed"] += 1
@@ -477,11 +533,16 @@ def main(args):
     )
 
     # Fail fast on configuration errors, before iterating findings.
-    # Check if Project exists
+    # Check if Project exists, and resolve --project-id to a numeric project id. The
+    # create payload uses {"project": {"id": ...}}, which rejects a project KEY ("NJT")
+    # with HTTP 400, while this preflight and the dedup search JQL both accept a key.
+    # Resolving once here means a key or a numeric id passes end to end (a key-valued
+    # --project-id used to pass every check and fail only at create).
     try:
-        jira.project(id=jira_project_id)
+        project = jira.project(id=jira_project_id)
     except JIRAError as e:
         raise ValueError(e.text)
+    resolved_project_id = getattr(project, "id", None) or jira_project_id
 
     # Get component id
     component_id = None
@@ -523,7 +584,7 @@ def main(args):
 
     counts = import_findings(
         jira, sarif_data,
-        project_id=jira_project_id,
+        project_id=resolved_project_id,
         issue_type=jira_issue_type,
         component_id=component_id,
         valid_priorities=valid_priorities,
@@ -565,7 +626,7 @@ if __name__ == "__main__":
     group_issue = parser.add_argument_group("Issue properties")
     group_issue.add_argument(
         "-p", "--project-id", action=EnvDefault, envvar="JIRA_PROJECT_ID", dest="project", metavar="PROJECT-ID",
-        help="Jira Project ID"
+        help="Jira project id or key (a key is resolved to its id)"
     )
     group_issue.add_argument(
         "-i", "--issue-type", action=EnvDefault, envvar="JIRA_ISSUE_TYPE", dest="type", default="Task",

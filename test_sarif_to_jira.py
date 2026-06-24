@@ -192,12 +192,60 @@ class PriorityAndSummaryTests(unittest.TestCase):
         self.assertIsNone(s2j.map_priority(None))
 
     def test_summary_includes_endpoint(self):
+        # No rule in the run: falls back to message.text for the class name.
         r = make_result("SQL Injection", endpoint="/api/orders")
-        self.assertEqual(s2j.build_summary(r), "SQL Injection at /api/orders")
+        self.assertEqual(s2j.build_summary(r, {}), "SQL Injection at /api/orders")
 
     def test_summary_without_endpoint(self):
         r = make_result("Missing Security Headers")
-        self.assertEqual(s2j.build_summary(r), "Missing Security Headers")
+        self.assertEqual(s2j.build_summary(r, {}), "Missing Security Headers")
+
+    def test_summary_prefers_rule_name_over_message(self):
+        # The summary class name comes from the rule, not message.text.
+        r = make_result("ignored message text", endpoint="/api/orders", rule_id="xss-id")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "name": "Cross Site Scripting (DOM Based)"}]}}}
+        self.assertEqual(
+            s2j.build_summary(r, run),
+            "Cross Site Scripting (DOM Based) at /api/orders")
+
+    def test_summary_falls_back_to_rule_short_description(self):
+        r = make_result("ignored", rule_id="r1")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "r1", "shortDescription": {"text": "SQL Injection"}}]}}}
+        self.assertEqual(s2j.build_summary(r, run), "SQL Injection")
+
+    def test_summary_from_cli_banner_is_single_line_and_bounded(self):
+        # Regression for the CLI producer: message.text is a long multi-line banner,
+        # the short class name is in rule.name. The summary must be single-line,
+        # <= 255 chars, and carry the rule name, not the banner.
+        banner = (
+            "Exploitable Vulnerability Found\n\n"
+            "Cross Site Scripting (DOM Based) on endpoint /search\n\n"
+            "For more information see the issue on NightVision here: "
+            "https://app.nightvision.net/scans/abc/issues/def\n" + ("x" * 3000))
+        r = make_result(banner, endpoint="/search", rule_id="xss-id")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "name": "Cross Site Scripting (DOM Based)"}]}}}
+        summary = s2j.build_summary(r, run)
+        self.assertEqual(summary, "Cross Site Scripting (DOM Based) at /search")
+        self.assertLessEqual(len(summary), s2j.JIRA_SUMMARY_MAX)
+        self.assertNotIn("\n", summary)
+        s2j.validate_summary(summary)  # must not raise
+
+    def test_normalize_summary_truncates_and_strips_newlines(self):
+        long_kind = "A" * 300
+        out = s2j.normalize_summary(long_kind + "\nmore")
+        self.assertEqual(len(out), s2j.JIRA_SUMMARY_MAX)
+        self.assertTrue(out.endswith("..."))
+        self.assertNotIn("\n", out)
+        s2j.validate_summary(out)  # must not raise
+
+    def test_validate_summary_rejects_overlong_and_multiline(self):
+        with self.assertRaises(ValueError):
+            s2j.validate_summary("x" * (s2j.JIRA_SUMMARY_MAX + 1))
+        with self.assertRaises(ValueError):
+            s2j.validate_summary("line one\nline two")
 
 
 class ImportLoopTests(unittest.TestCase):
