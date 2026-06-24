@@ -519,5 +519,64 @@ class AdfRenderingTests(unittest.TestCase):
         self.assertEqual(fields["description"]["type"], "doc")
 
 
+class DescriptionSourceTests(unittest.TestCase):
+    """get_description (Option 1 stopgap): keep fullDescription as the body and
+    always surface the per-finding deep link from message.text."""
+
+    @staticmethod
+    def _hrefs(doc):
+        out = []
+        def walk(n):
+            if isinstance(n, dict):
+                for m in n.get("marks", []) or []:
+                    if m.get("type") == "link":
+                        out.append(m["attrs"]["href"])
+                for c in n.get("content", []) or []:
+                    walk(c)
+        walk(doc)
+        return out
+
+    def test_extract_finding_link(self):
+        link = "https://test.nightvision.net/scans/abc/findings/custom/uuid/?issueId=zzz-111"
+        self.assertEqual(s2j.extract_finding_link("see here: " + link), link)
+        self.assertIsNone(s2j.extract_finding_link("no url here"))
+        # trailing sentence punctuation is not part of the URL
+        self.assertEqual(s2j.extract_finding_link("see " + link + "."), link)
+
+    def test_cli_stub_gets_deep_link_appended(self):
+        link = ("https://test.nightvision.net/scans/abc/findings/31/"
+                "?issueId=39b75813-927c-40de-a326-2dfd023635ef")
+        result = {
+            "ruleId": "xss-id",
+            "message": {"text": "Exploitable Vulnerability Found. For more "
+                                "information see the issue on NightVision here: " + link},
+        }
+        stub = ("Cross Site Scripting (DOM Based). NightVision flags findings of this "
+                "kind; see the individual result for the affected endpoint and "
+                "remediation detail.")
+        run = {"tool": {"driver": {"rules": [
+            {"id": "xss-id", "fullDescription": {"text": stub}}]}}}
+        body = s2j.get_description(result, run)
+        self.assertIn("NightVision flags findings of this kind", body)  # stub kept
+        self.assertIn(link, body)                                       # deep link surfaced
+        self.assertIn(link, self._hrefs(s2j.to_adf(body)))              # renders as a link
+
+    def test_backend_rich_body_not_duplicated(self):
+        # Backend: the deep link already rides inside fullDescription; message.text
+        # is the kind name (no URL). Body stays the rich writeup, link not re-added.
+        link = "https://app.nightvision.net/scans/x/findings/12/?issueId=aaaa-bbbb"
+        rich = "Detailed writeup with remediation. More information: " + link
+        result = {"ruleId": "190", "message": {"text": "Absence of Anti-CSRF Tokens"}}
+        run = {"tool": {"driver": {"rules": [
+            {"id": "190", "fullDescription": {"text": rich}}]}}}
+        body = s2j.get_description(result, run)
+        self.assertEqual(body, rich)
+        self.assertEqual(body.count(link), 1)
+
+    def test_no_url_in_message_means_no_append(self):
+        result = make_result("SQLi", endpoint="/x")  # message.text="SQLi", no rule
+        self.assertEqual(s2j.get_description(result, {}), "SQLi")
+
+
 if __name__ == "__main__":
     unittest.main()

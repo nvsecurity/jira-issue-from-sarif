@@ -251,15 +251,43 @@ def build_summary(result, run):
     return normalize_summary(summary)
 
 
+# A NightVision finding deep link. The CLI carries it in the result message.text;
+# the backend carries it inside fullDescription. Matches an http(s) URL, excluding
+# trailing whitespace, closing brackets, and sentence punctuation.
+_FINDING_URL_RE = re.compile(r"https?://[^\s)>\]]*[^\s)>\].,;:!?]")
+
+
+def extract_finding_link(message):
+    """Return the deep link URL from a finding message, or None if absent."""
+    m = _FINDING_URL_RE.search(message or "")
+    return m.group(0) if m else None
+
+
 def get_description(result, run):
-    """The rule's full description text, looked up by ruleId (existing behaviour)."""
+    """The ticket body: the rule's full description, plus the per-finding deep link.
+
+    For the backend producer the deep link already rides inside fullDescription, so
+    nothing is appended. For the CLI producer fullDescription is a generic per-kind
+    stub and the deep link lives in message.text, so append it; to_adf renders the
+    bare URL as a clickable link. This is a deliberate stopgap: once both producers
+    carry the rich per-finding writeup on the result message (NV-4496 backend,
+    NV-4502 CLI), switch the body source to message.text.
+    """
+    message = (result.get("message") or {}).get("text") or ""
     rule = find_rule(run, result.get("ruleId"))
+    body = None
     if rule:
         full = rule.get("fullDescription") or {}
         if full.get("text"):
-            return full["text"]
-    # Fall back to the finding message so the ticket is never bodyless.
-    return (result.get("message") or {}).get("text") or "No description available."
+            body = full["text"]
+    if body is None:
+        # Never bodyless: fall back to the finding message.
+        body = message or "No description available."
+
+    link = extract_finding_link(message)
+    if link and link not in body:
+        body = body.rstrip() + "\n\nMore information: " + link
+    return body
 
 
 # ---------------------------------------------------------------------------------------------------------------------
