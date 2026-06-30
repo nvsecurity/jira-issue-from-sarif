@@ -17,6 +17,8 @@ This repository contains scripts and configurations to interact with Jira and ma
 
 This repository automates the process of creating Jira tickets based on vulnerabilities found by NightVision. It includes scripts to fetch Jira project IDs, convert SARIF reports to Jira issues, and a sample OpenAPI specification.
 
+> NightVision's CLI files Jira tickets from a scan with `nightvision export jira`, and the built-in Jira status sync (configured in the NightVision app) updates a linked finding's resolution when its Jira issue changes status. This script is an alternative that files tickets from a SARIF file, for workflows that already produce SARIF.
+
 ## Prerequisites
 
 - Python 3.x
